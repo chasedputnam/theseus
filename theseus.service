@@ -1,0 +1,15 @@
+[Unit]
+Description=Theseus AI Workspace
+After=network.target
+
+[Service]
+Type=simple
+User=theseus
+WorkingDirectory=/opt/theseus
+ExecStart=/opt/theseus/theseus --port 7000 --data-dir /opt/theseus/data --static-dir /opt/theseus/static
+Restart=on-failure
+RestartSec=5
+Environment=AUTH_ENABLED=true
+
+[Install]
+WantedBy=multi-user.target
