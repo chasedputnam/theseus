@@ -1,5 +1,7 @@
-# Data directory — contains user data, secrets, and the encryption key
-data/
+# Top-level data directory — contains user data, secrets, and the encryption key.
+# Use /data/ (anchored) so it only matches the root-level data/ directory,
+# not internal/cookbook/data/ which contains embedded source assets.
+/data/
 
 # Built binaries
 theseus
