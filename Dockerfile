@@ -19,7 +19,7 @@ RUN ["go", "mod", "download"]
 COPY . .
 
 # Build — GOARCH is inherited from the platform docker buildx selects
-RUN ["go", "build", "-trimpath", "-ldflags=-s -w", "-o", "theseus", "./cmd/theseus"]
+RUN ["go", "build", "-trimpath", "-buildvcs=false", "-ldflags=-s -w", "-o", "theseus", "./cmd/theseus"]
 
 # Runtime stage
 FROM alpine:3.21
