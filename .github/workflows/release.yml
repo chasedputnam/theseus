@@ -6,10 +6,15 @@ on:
 
 permissions:
   contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  release:
-    name: Build and Release
+  build-binaries:
+    name: Build Binaries
     runs-on: ubuntu-latest
 
     steps:
@@ -24,80 +29,123 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Build cross-platform binaries
+      - name: Build all platform binaries
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          echo "Building version: $VERSION"
           LDFLAGS="-s -w -X main.version=${VERSION}"
-
           mkdir -p build
 
-          # Linux amd64
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-            go build -trimpath -ldflags "${LDFLAGS}" \
-            -o build/theseus-linux-amd64 ./cmd/theseus
+          declare -A TARGETS=(
+            ["linux/amd64"]="theseus-linux-amd64"
+            ["linux/arm64"]="theseus-linux-arm64"
+            ["darwin/amd64"]="theseus-darwin-amd64"
+            ["darwin/arm64"]="theseus-darwin-arm64"
+            ["windows/amd64"]="theseus-windows-amd64.exe"
+            ["windows/arm64"]="theseus-windows-arm64.exe"
+          )
 
-          # Linux arm64
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
-            go build -trimpath -ldflags "${LDFLAGS}" \
-            -o build/theseus-linux-arm64 ./cmd/theseus
-
-          # macOS amd64 (Intel)
-          GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 \
-            go build -trimpath -ldflags "${LDFLAGS}" \
-            -o build/theseus-darwin-amd64 ./cmd/theseus
-
-          # macOS arm64 (Apple Silicon)
-          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 \
-            go build -trimpath -ldflags "${LDFLAGS}" \
-            -o build/theseus-darwin-arm64 ./cmd/theseus
-
-          # Windows amd64
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
-            go build -trimpath -ldflags "${LDFLAGS}" \
-            -o build/theseus-windows-amd64.exe ./cmd/theseus
-
-          # Windows arm64
-          GOOS=windows GOARCH=arm64 CGO_ENABLED=0 \
-            go build -trimpath -ldflags "${LDFLAGS}" \
-            -o build/theseus-windows-arm64.exe ./cmd/theseus
-
-      - name: Package static assets
-        run: |
-          # Bundle static/ into a zip so users can download frontend + binary together
-          cd build
-          for bin in theseus-linux-amd64 theseus-linux-arm64 theseus-darwin-amd64 theseus-darwin-arm64; do
-            mkdir -p pkg/${bin}
-            cp ${bin} pkg/${bin}/theseus
-            cp -r ../static pkg/${bin}/static
-            cp ../.env.example pkg/${bin}/.env.example
-            tar -czf ${bin}.tar.gz -C pkg/${bin} .
+          for target in "${!TARGETS[@]}"; do
+            OS="${target%/*}"
+            ARCH="${target#*/}"
+            OUT="build/${TARGETS[$target]}"
+            echo "Building $OS/$ARCH -> $OUT"
+            GOOS=$OS GOARCH=$ARCH CGO_ENABLED=0 \
+              go build -trimpath -ldflags "${LDFLAGS}" \
+              -o "$OUT" ./cmd/theseus
           done
-          for bin in theseus-windows-amd64 theseus-windows-arm64; do
-            mkdir -p pkg/${bin}
-            cp ${bin}.exe pkg/${bin}/theseus.exe
-            cp -r ../static pkg/${bin}/static
-            cp ../.env.example pkg/${bin}/.env.example
-            cd pkg/${bin} && zip -r ../../${bin}.zip . && cd ../..
-          done
+
+          ls -lh build/
 
       - name: Generate checksums
         run: |
           cd build
-          sha256sum *.tar.gz *.zip > checksums.txt
+          sha256sum * > checksums.txt
           cat checksums.txt
+
+      - name: Upload binaries as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: build/
+          retention-days: 1
+
+  build-docker:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+            type=raw,value=latest
+
+      - name: Build and push multi-platform image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image digest
+        run: echo "${{ steps.meta.outputs.digest }}"
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-binaries, build-docker]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: build/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            build/theseus-linux-amd64.tar.gz
-            build/theseus-linux-arm64.tar.gz
-            build/theseus-darwin-amd64.tar.gz
-            build/theseus-darwin-arm64.tar.gz
-            build/theseus-windows-amd64.zip
-            build/theseus-windows-arm64.zip
+            build/theseus-linux-amd64
+            build/theseus-linux-arm64
+            build/theseus-darwin-amd64
+            build/theseus-darwin-arm64
+            build/theseus-windows-amd64.exe
+            build/theseus-windows-arm64.exe
             build/checksums.txt
             docker-compose.yml
             .env.example

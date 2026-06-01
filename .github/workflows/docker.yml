@@ -1,0 +1,143 @@
+name: Docker
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run tests
+        run: go test -race -timeout 120s ./...
+
+  build:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      - name: Build image for testing (amd64 only)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: theseus:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: theseus:test
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+        continue-on-error: true
+
+      - name: Ensure SARIF file exists
+        if: always()
+        run: |
+          if [ ! -f trivy-results.sarif ]; then
+            echo '{"version":"2.1.0","runs":[]}' > trivy-results.sarif
+          fi
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: docker-image
+
+      - name: Test Docker image
+        run: |
+          docker run -d \
+            --name theseus-test \
+            -p 7000:7000 \
+            -e AUTH_ENABLED=false \
+            theseus:test
+
+          echo "Waiting for container to start..."
+          sleep 8
+
+          docker ps -a
+          echo "Container logs:"
+          docker logs theseus-test
+
+          echo "Testing health endpoint..."
+          curl -f http://localhost:7000/api/health || exit 1
+
+          echo "Testing version endpoint..."
+          curl -f http://localhost:7000/api/version || exit 1
+
+          RESTARTS=$(docker inspect -f '{{.RestartCount}}' theseus-test)
+          echo "Container restart count: $RESTARTS"
+          if [ "$RESTARTS" -ne 0 ]; then
+            echo "ERROR: Container restarted $RESTARTS times"
+            docker logs theseus-test
+            exit 1
+          fi
+
+          docker stop theseus-test
+          docker rm theseus-test
+
+      - name: Build and push multi-platform image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image digest
+        run: echo "${{ steps.meta.outputs.digest }}"

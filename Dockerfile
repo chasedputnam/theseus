@@ -1,6 +1,10 @@
 # Build stage
 FROM golang:1.22-alpine AS builder
 
+ARG VERSION=dev
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
 WORKDIR /build
 
 # Install build dependencies
@@ -13,8 +17,11 @@ RUN go mod download
 # Copy source
 COPY . .
 
-# Build binary
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o theseus ./cmd/theseus
+# Build binary — uses TARGETOS/TARGETARCH set by docker buildx for multi-platform builds
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath \
+    -ldflags="-s -w -X main.version=${VERSION}" \
+    -o theseus ./cmd/theseus
 
 # Runtime stage
 FROM alpine:3.19
