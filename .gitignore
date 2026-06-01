@@ -4,8 +4,7 @@
 /data/
 
 # Built binaries
-theseus
-theseus-*
+./theseus
 build/
 
 # Environment files
@@ -20,6 +19,7 @@ build/
 .vscode/
 *.swp
 *.swo
+specs/
 
 # Go test cache
 *.test
