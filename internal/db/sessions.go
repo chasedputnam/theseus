@@ -85,6 +85,12 @@ func (db *DB) TouchSession(id string) error {
 	return err
 }
 
+// UpdateSessionSortOrder sets the sort_order for a session.
+func (db *DB) UpdateSessionSortOrder(id string, order int) error {
+	_, err := db.Exec(`UPDATE sessions SET sort_order=? WHERE id=?`, order, id)
+	return err
+}
+
 // AddMessage inserts a chat message and updates session counters.
 func (db *DB) AddMessage(m *ChatMessage) error {
 	meta := ""
@@ -140,6 +146,44 @@ func (db *DB) ListMessages(sessionID string) ([]*ChatMessage, error) {
 // DeleteMessages removes all messages for a session.
 func (db *DB) DeleteMessages(sessionID string) error {
 	_, err := db.Exec(`DELETE FROM chat_messages WHERE session_id=?`, sessionID)
+	return err
+}
+
+// UpdateMessage updates the content and metadata of a single message.
+func (db *DB) UpdateMessage(id, content string, metadata sql.NullString) error {
+	_, err := db.Exec(`UPDATE chat_messages SET content=?, metadata=? WHERE id=?`, content, metadata, id)
+	return err
+}
+
+// TruncateMessages deletes all messages in a session after the given message ID (by timestamp).
+func (db *DB) TruncateMessages(sessionID, afterMessageID string) error {
+	row := db.QueryRow(`SELECT timestamp FROM chat_messages WHERE id=? AND session_id=?`, afterMessageID, sessionID)
+	var ts string
+	if err := row.Scan(&ts); err != nil {
+		return fmt.Errorf("message not found: %w", err)
+	}
+	_, err := db.Exec(`DELETE FROM chat_messages WHERE session_id=? AND timestamp > ?`, sessionID, ts)
+	return err
+}
+
+// GetMessage returns a single message by ID.
+func (db *DB) GetMessage(id string) (*ChatMessage, error) {
+	row := db.QueryRow(`SELECT id,session_id,role,content,metadata,timestamp FROM chat_messages WHERE id=?`, id)
+	m := &ChatMessage{}
+	var ts string
+	if err := row.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Metadata, &ts); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("message not found")
+		}
+		return nil, err
+	}
+	m.Timestamp, _ = time.Parse(time.RFC3339, ts)
+	return m, nil
+}
+
+// DeleteMessageByID removes a single message by ID.
+func (db *DB) DeleteMessageByID(id string) error {
+	_, err := db.Exec(`DELETE FROM chat_messages WHERE id=?`, id)
 	return err
 }
 

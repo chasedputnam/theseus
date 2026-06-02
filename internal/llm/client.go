@@ -159,7 +159,7 @@ func (c *Client) Stream(ctx context.Context, req StreamRequest) (<-chan StreamCh
 		return nil, fmt.Errorf("LLM endpoint unreachable (cooldown): %s", c.hostKey(req.URL))
 	}
 
-	endpoint := strings.TrimRight(req.URL, "/") + "/v1/chat/completions"
+	endpoint := NormalizeBaseURL(req.URL) + "/v1/chat/completions"
 
 	body := map[string]any{
 		"model":    req.Model,
@@ -259,7 +259,7 @@ func (c *Client) Call(ctx context.Context, req CallRequest) (string, error) {
 		return "", fmt.Errorf("LLM endpoint unreachable (cooldown): %s", c.hostKey(req.URL))
 	}
 
-	endpoint := strings.TrimRight(req.URL, "/") + "/v1/chat/completions"
+	endpoint := NormalizeBaseURL(req.URL) + "/v1/chat/completions"
 
 	body := map[string]any{
 		"model":    req.Model,
@@ -320,9 +320,19 @@ func (c *Client) Call(ctx context.Context, req CallRequest) (string, error) {
 	return result.Choices[0].Message.Content, nil
 }
 
-// DiscoverModels fetches the model list from an OpenAI-compatible endpoint.
+// NormalizeBaseURL strips trailing slashes and a trailing /v1 so callers
+// can safely append /v1/... without doubling the prefix.
+func NormalizeBaseURL(u string) string {
+	u = strings.TrimRight(u, "/")
+	u = strings.TrimSuffix(u, "/v1/chat/completions")
+	u = strings.TrimSuffix(u, "/v1")
+	return u
+}
+
+
 func (c *Client) DiscoverModels(ctx context.Context, baseURL string, headers map[string]string) ([]string, error) {
-	endpoint := strings.TrimRight(baseURL, "/") + "/v1/models"
+	base := NormalizeBaseURL(baseURL)
+	endpoint := base + "/v1/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -339,6 +349,13 @@ func (c *Client) DiscoverModels(ctx context.Context, baseURL string, headers map
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("auth required (HTTP %d)", resp.StatusCode)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
 
 	var result struct {
 		Data []struct {

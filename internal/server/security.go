@@ -2,7 +2,6 @@ package server
 
 import (
 	"sync"
-	"context"
 	"net/http"
 	"strings"
 	"time"
@@ -16,7 +15,7 @@ func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
 		w.Header().Set("Content-Security-Policy",
-			"default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self' data:; media-src 'self' blob:;")
+			"default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: blob:; connect-src 'self'; font-src 'self' data: https://cdn.jsdelivr.net; media-src 'self' blob:;")
 		// Service worker needs this header
 		if r.URL.Path == "/static/sw.js" || r.URL.Path == "/sw.js" {
 			w.Header().Set("Service-Worker-Allowed", "/")
@@ -28,6 +27,7 @@ func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 // RequestTimeoutMiddleware aborts requests that exceed the timeout, exempting streaming paths.
 func RequestTimeoutMiddleware(timeout time.Duration, exemptPrefixes []string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
+		timedOut := http.TimeoutHandler(next, timeout, `{"error":"Request timeout"}`)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			path := r.URL.Path
 			for _, p := range exemptPrefixes {
@@ -36,29 +36,8 @@ func RequestTimeoutMiddleware(timeout time.Duration, exemptPrefixes []string) fu
 					return
 				}
 			}
-			ctx, cancel := context.WithTimeout(r.Context(), timeout)
-			defer cancel()
-			done := make(chan struct{})
-			var panicVal any
-			go func() {
-				defer func() {
-					if v := recover(); v != nil {
-						panicVal = v
-					}
-					close(done)
-				}()
-				next.ServeHTTP(w, r.WithContext(ctx))
-			}()
-			select {
-			case <-done:
-				if panicVal != nil {
-					panic(panicVal)
-				}
-			case <-ctx.Done():
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusGatewayTimeout)
-				w.Write([]byte(`{"error":"Request timeout"}`))
-			}
+			w.Header().Set("Content-Type", "application/json")
+			timedOut.ServeHTTP(w, r)
 		})
 	}
 }
@@ -103,4 +82,25 @@ func (rl *RateLimiter) Increment(user string) {
 	rl.mu.Lock()
 	rl.counts[user]++
 	rl.mu.Unlock()
+}
+
+// MaxBodyMiddleware limits request body size for non-exempt paths.
+func MaxBodyMiddleware(limit int64, exemptPrefixes []string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+				next.ServeHTTP(w, r)
+				return
+			}
+			path := r.URL.Path
+			for _, p := range exemptPrefixes {
+				if strings.HasPrefix(path, p) {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+			next.ServeHTTP(w, r)
+		})
+	}
 }

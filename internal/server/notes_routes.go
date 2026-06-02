@@ -5,18 +5,30 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/chaseputnam/theseus/internal/auth"
 	"github.com/chaseputnam/theseus/internal/db"
+	"github.com/chaseputnam/theseus/internal/llm"
+	"github.com/chaseputnam/theseus/internal/settings"
 	"github.com/google/uuid"
 )
 
 func (s *Server) registerNotesRoutes() {
 	s.mux.HandleFunc("/api/notes", s.withAuth(s.handleNotes))
+	s.mux.HandleFunc("/api/notes/fire-reminder", s.withAuth(s.handleNotesFireReminder))
+	s.mux.HandleFunc("/api/notes/reorder", s.withAuth(s.handleNotesReorder))
 	s.mux.HandleFunc("/api/notes/", s.withAuth(s.handleNoteByID))
 	s.mux.HandleFunc("/api/tasks", s.withAuth(s.handleTasks))
+	s.mux.HandleFunc("/api/tasks/meta/actions", s.withAuth(s.handleTasksMeta))
+	s.mux.HandleFunc("/api/tasks/meta/events", s.withAuth(s.handleTasksMeta))
+	s.mux.HandleFunc("/api/tasks/meta/output-targets", s.withAuth(s.handleTasksMeta))
+	s.mux.HandleFunc("/api/tasks/notifications", s.withAuth(s.handleTasksNotifications))
+	s.mux.HandleFunc("/api/tasks/onboarding", s.withAuth(s.handleTasksOnboarding))
+	s.mux.HandleFunc("/api/tasks/parse", s.withAuth(s.handleTasksParse))
+	s.mux.HandleFunc("/api/tasks/runs/recent", s.withAuth(s.handleTasksRunsRecent))
 	s.mux.HandleFunc("/api/tasks/", s.withAuth(s.handleTaskByID))
 }
 
@@ -238,11 +250,50 @@ func (s *Server) handleTaskByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if action == "runs" {
-		runs, _ := s.db.ListTaskRuns(id, 20)
+		limit := 20
+		if l := r.URL.Query().Get("limit"); l != "" {
+			if n, err := strconv.Atoi(l); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		runs, _ := s.db.ListTaskRuns(id, limit)
 		if runs == nil {
 			runs = []*db.TaskRun{}
 		}
 		writeJSON(w, http.StatusOK, runs)
+		return
+	}
+
+	if r.Method == http.MethodPost && (action == "run" || action == "pause" || action == "resume" || action == "revert") {
+		switch action {
+		case "run":
+			run := &db.TaskRun{
+				ID:        uuid.New().String(),
+				TaskID:    id,
+				StartedAt: time.Now().UTC(),
+				Status:    "running",
+			}
+			if err := s.db.CreateTaskRun(run); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			task.Status = "running"
+			task.LastRun = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+			s.db.UpdateScheduledTask(task)
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "run_id": run.ID})
+		case "pause":
+			task.Status = "paused"
+			s.db.UpdateScheduledTask(task)
+			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		case "resume":
+			task.Status = "active"
+			s.db.UpdateScheduledTask(task)
+			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		case "revert":
+			task.Status = "active"
+			s.db.UpdateScheduledTask(task)
+			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		}
 		return
 	}
 
@@ -280,6 +331,177 @@ func (s *Server) handleTaskByID(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) handleNotesReorder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		return
+	}
+	for i, id := range req.IDs {
+		s.db.UpdateNoteSortOrder(id, i)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleNotesFireReminder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		NoteID string `json:"note_id"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "note_id": req.NoteID})
+}
+
+func (s *Server) handleTasksMeta(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	suffix := strings.TrimPrefix(r.URL.Path, "/api/tasks/meta/")
+	switch suffix {
+	case "actions":
+		writeJSON(w, http.StatusOK, map[string]any{"actions": []string{
+			"send_message", "run_shell", "create_note", "create_document",
+			"send_email", "webhook", "research", "summarize",
+		}})
+	case "events":
+		writeJSON(w, http.StatusOK, map[string]any{"events": []string{
+			"schedule", "on_message", "on_document_created", "on_email_received",
+			"on_session_ended", "manual",
+		}})
+	case "output-targets":
+		writeJSON(w, http.StatusOK, map[string]any{"output_targets": []string{
+			"session", "note", "document", "email", "webhook", "none",
+		}})
+	default:
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown meta key"})
+	}
+}
+
+func (s *Server) handleTasksNotifications(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	user := auth.CurrentUser(r)
+	tasks, err := s.db.ListScheduledTasks(user)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	var notifications []map[string]any
+	for _, t := range tasks {
+		if t.Status == "failed" || t.Status == "completed" {
+			runs, _ := s.db.ListTaskRuns(t.ID, 1)
+			var lastRun *db.TaskRun
+			if len(runs) > 0 {
+				lastRun = runs[0]
+			}
+			n := map[string]any{
+				"task_id":   t.ID,
+				"task_name": t.Name,
+				"status":    t.Status,
+			}
+			if lastRun != nil {
+				n["run_id"] = lastRun.ID
+				n["finished_at"] = lastRun.FinishedAt
+				if lastRun.Error.Valid {
+					n["error"] = lastRun.Error.String
+				}
+			}
+			notifications = append(notifications, n)
+		}
+	}
+	if notifications == nil {
+		notifications = []map[string]any{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"notifications": notifications})
+}
+
+func (s *Server) handleTasksOnboarding(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"templates": []map[string]any{
+		{"name": "Daily Summary", "prompt": "Summarize my notes from today", "schedule": "daily", "task_type": "llm"},
+		{"name": "Weekly Report", "prompt": "Create a weekly report from my sessions", "schedule": "weekly", "task_type": "llm"},
+		{"name": "Email Digest", "prompt": "Summarize unread emails", "schedule": "daily", "task_type": "llm", "output_target": "email"},
+	}})
+}
+
+func (s *Server) handleTasksParse(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Text == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text required"})
+		return
+	}
+	endpointURL := settings.GetString("default_endpoint_url")
+	model := settings.GetString("default_model")
+	prompt := `Parse the following natural language task description into a JSON object with fields: name (string), prompt (string), schedule (one of: once, daily, weekly, monthly, or empty), task_type (string), trigger_type (string). Return only valid JSON.
+
+Text: ` + req.Text
+	var result strings.Builder
+	lc := llm.New()
+	ch, err := lc.Stream(r.Context(), llm.StreamRequest{
+		URL:   endpointURL,
+		Model: model,
+		Messages: []llm.Message{
+			{Role: "user", Content: prompt},
+		},
+	})
+	if err == nil {
+		for chunk := range ch {
+			if chunk.Error == nil {
+				result.WriteString(chunk.Delta)
+			}
+		}
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(result.String()), &parsed); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"raw": result.String()})
+		return
+	}
+	writeJSON(w, http.StatusOK, parsed)
+}
+
+func (s *Server) handleTasksRunsRecent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	user := auth.CurrentUser(r)
+	tasks, err := s.db.ListScheduledTasks(user)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	var allRuns []*db.TaskRun
+	for _, t := range tasks {
+		runs, _ := s.db.ListTaskRuns(t.ID, 100)
+		allRuns = append(allRuns, runs...)
+	}
+	if allRuns == nil {
+		allRuns = []*db.TaskRun{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": allRuns})
 }
 
 // computeNextRun calculates the next run time for a task.

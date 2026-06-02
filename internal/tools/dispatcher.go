@@ -53,7 +53,7 @@ func (d *Dispatcher) Execute(ctx context.Context, block agent.ToolBlock, owner s
 	case "web_search":
 		return DoWebSearch(ctx, block.Content)
 	default:
-		return fmt.Sprintf("[tool %q not yet implemented]", block.ToolType), nil
+		return "", fmt.Errorf("tool %q is not implemented", block.ToolType)
 	}
 }
 

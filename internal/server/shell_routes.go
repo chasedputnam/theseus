@@ -146,7 +146,12 @@ func (s *Server) handleShellStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	cmd.Wait()
-	sendEvent("done", `{"status":"done"}`)
+	exitCode := 0
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	}
+	d, _ := json.Marshal(map[string]any{"status": "done", "exit_code": exitCode})
+	sendEvent("done", string(d))
 }
 
 func (s *Server) handleShellTmuxLog(w http.ResponseWriter, r *http.Request) {

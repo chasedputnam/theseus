@@ -161,17 +161,21 @@ func (c *stdioClient) sendRequest(ctx context.Context, req map[string]any) (map[
 		return nil, fmt.Errorf("write to MCP stdin: %w", err)
 	}
 
-	// Read response line
+	// Read response line — goroutine may leak if ctx is cancelled before ReadString
+	// returns, but the subprocess pipe will be closed by Close() which unblocks it.
 	done := make(chan struct {
 		line string
 		err  error
 	}, 1)
 	go func() {
 		line, err := c.stdout.ReadString('\n')
-		done <- struct {
+		select {
+		case done <- struct {
 			line string
 			err  error
-		}{line, err}
+		}{line, err}:
+		default:
+		}
 	}()
 
 	select {

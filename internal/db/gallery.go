@@ -41,6 +41,13 @@ func (db *DB) GetGalleryImageByHash(hash, owner string) (*GalleryImage, error) {
 	return scanGalleryImage(row)
 }
 
+// SessionHasImages returns true if any active gallery images exist for the session.
+func (db *DB) SessionHasImages(sessionID string) (bool, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM gallery_images WHERE session_id=? AND is_active=1`, sessionID).Scan(&count)
+	return count > 0, err
+}
+
 func (db *DB) ListGalleryImages(owner string, albumID string, limit, offset int) ([]*GalleryImage, error) {
 	q := `SELECT id,filename,prompt,model,size,quality,tags,ai_tags,session_id,album_id,
 		owner,is_active,favorite,file_hash,taken_at,camera_make,camera_model,gps_lat,gps_lng,

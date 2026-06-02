@@ -20,6 +20,7 @@ import (
 func (s *Server) registerCompareRoutes() {
 	s.mux.HandleFunc("/api/compare/start", s.withAuth(s.handleCompareStart))
 	s.mux.HandleFunc("/api/compare/vote", s.withAuth(s.handleCompareVote))
+	s.mux.HandleFunc("/api/compare/record", s.withAuth(s.handleCompareVote))
 	s.mux.HandleFunc("/api/compare/history", s.withAuth(s.handleCompareHistory))
 	s.mux.HandleFunc("/api/compare/", s.withAuth(s.handleCompareByID))
 }
@@ -131,7 +132,7 @@ func (s *Server) handleCompareStart(w http.ResponseWriter, r *http.Request) {
 				mu.Lock()
 				sb.WriteString(chunk.Delta)
 				mu.Unlock()
-				d, _ := json.Marshal(map[string]string{"side": side, "content": chunk.Delta})
+				d, _ := json.Marshal(map[string]string{"side": side, "delta": chunk.Delta})
 				sendEvent("delta", string(d))
 			}
 		}
@@ -153,6 +154,10 @@ func (s *Server) handleCompareStart(w http.ResponseWriter, r *http.Request) {
 
 	d, _ := json.Marshal(map[string]string{"comparison_id": compID, "status": "done"})
 	sendEvent("done", string(d))
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
 }
 
 func (s *Server) handleCompareVote(w http.ResponseWriter, r *http.Request) {

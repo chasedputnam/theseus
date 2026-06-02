@@ -21,6 +21,8 @@ import (
 func (s *Server) registerGalleryRoutes() {
 	s.mux.HandleFunc("/api/gallery", s.withAuth(s.handleGallery))
 	s.mux.HandleFunc("/api/gallery/upload", s.withAuth(s.handleGalleryUpload))
+	s.mux.HandleFunc("/api/gallery/library", s.withAuth(s.handleGalleryLibrary))
+	s.mux.HandleFunc("/api/gallery/style-transfer", s.withAuth(s.handleGalleryStyleTransfer))
 	s.mux.HandleFunc("/api/gallery/albums", s.withAuth(s.handleGalleryAlbums))
 	s.mux.HandleFunc("/api/gallery/albums/", s.withAuth(s.handleGalleryAlbumByID))
 	s.mux.HandleFunc("/api/gallery/", s.withAuth(s.handleGalleryImageByID))
@@ -119,7 +121,53 @@ func (s *Server) handleGalleryUpload(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGalleryImageByID(w http.ResponseWriter, r *http.Request) {
 	user := auth.CurrentUser(r)
-	id := strings.TrimPrefix(r.URL.Path, "/api/gallery/")
+	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/api/gallery/"), "/", 2)
+	id := parts[0]
+	action := ""
+	if len(parts) > 1 {
+		action = parts[1]
+	}
+
+	if action == "replace" && r.Method == http.MethodPost {
+		if err := r.ParseMultipartForm(50 << 20); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid form"})
+			return
+		}
+		file, header, err := r.FormFile("image")
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "image required"})
+			return
+		}
+		defer file.Close()
+		content, err := io.ReadAll(file)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		imgDir := filepath.Join(s.cfg.DataDir, "generated_images")
+		ext := strings.ToLower(filepath.Ext(header.Filename))
+		if ext == "" {
+			ext = ".jpg"
+		}
+		filename := uuid.New().String() + ext
+		if err := os.WriteFile(filepath.Join(imgDir, filename), content, 0644); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		img, err := s.db.GetGalleryImage(id)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
+		img.Filename = filename
+		if err := s.db.UpdateGalleryImage(img); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "filename": filename, "id": id})
+		return
+	}
+
 	img, err := s.db.GetGalleryImage(id)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
@@ -230,6 +278,71 @@ func (s *Server) handleGalleryAlbumByID(w http.ResponseWriter, r *http.Request) 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) handleGalleryLibrary(w http.ResponseWriter, r *http.Request) {
+	user := auth.CurrentUser(r)
+	images, err := s.db.ListGalleryImages(user, "", 500, 0)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if images == nil {
+		images = []*db.GalleryImage{}
+	}
+	albums, _ := s.db.ListGalleryAlbums(user)
+	if albums == nil {
+		albums = []*db.GalleryAlbum{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": images, "albums": albums, "total": len(images)})
+}
+
+func (s *Server) handleGalleryStyleTransfer(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	user := auth.CurrentUser(r)
+	if err := r.ParseMultipartForm(50 << 20); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid form"})
+		return
+	}
+	file, header, err := r.FormFile("image")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "image required"})
+		return
+	}
+	defer file.Close()
+	content, err := io.ReadAll(file)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	imgDir := filepath.Join(s.cfg.DataDir, "generated_images")
+	os.MkdirAll(imgDir, 0755)
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if ext == "" {
+		ext = ".jpg"
+	}
+	filename := uuid.New().String() + ext
+	if err := os.WriteFile(filepath.Join(imgDir, filename), content, 0644); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	prompt := r.FormValue("prompt")
+	img := &db.GalleryImage{
+		ID:       uuid.New().String(),
+		Filename: filename,
+		Prompt:   prompt,
+		Tags:     "style-transfer",
+		Owner:    sql.NullString{String: user, Valid: user != ""},
+		IsActive: true,
+	}
+	if err := s.db.CreateGalleryImage(img); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": img.ID, "filename": filename})
 }
 
 func (s *Server) handleEditorDrafts(w http.ResponseWriter, r *http.Request) {

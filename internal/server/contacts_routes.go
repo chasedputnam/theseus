@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/chaseputnam/theseus/internal/auth"
 	"github.com/chaseputnam/theseus/internal/settings"
 	"github.com/chaseputnam/theseus/internal/storage"
 	"github.com/google/uuid"
@@ -25,6 +24,12 @@ type Contact struct {
 func (s *Server) registerContactsRoutes() {
 	s.mux.HandleFunc("/api/contacts", s.withAuth(s.handleContacts))
 	s.mux.HandleFunc("/api/contacts/search", s.withAuth(s.handleContactsSearch))
+	s.mux.HandleFunc("/api/contacts/export", s.withAuth(s.handleContactsExport))
+	s.mux.HandleFunc("/api/contacts/import", s.withAuth(s.handleContactsImport))
+	s.mux.HandleFunc("/api/contacts/clear", s.withAuth(s.handleContactsClear))
+	s.mux.HandleFunc("/api/contacts/config", s.withAuth(s.handleContactsConfig))
+	s.mux.HandleFunc("/api/contacts/list", s.withAuth(s.handleContactsList))
+	s.mux.HandleFunc("/api/contacts/add", s.withAuth(s.handleContactsAdd))
 	s.mux.HandleFunc("/api/contacts/", s.withAuth(s.handleContactByID))
 }
 
@@ -33,17 +38,6 @@ func (s *Server) contactsFile() string {
 }
 
 func (s *Server) loadContacts() ([]*Contact, error) {
-	// Try CardDAV first
-	cardDAVURL := settings.GetString("carddav_url")
-	if cardDAVURL != "" {
-		contacts, err := fetchCardDAVContacts(cardDAVURL,
-			settings.GetString("carddav_username"),
-			settings.GetString("carddav_password"))
-		if err == nil {
-			return contacts, nil
-		}
-	}
-	// Fall back to local JSON
 	var contacts []*Contact
 	if err := storage.ReadJSON(s.contactsFile(), &contacts); err != nil {
 		if os.IsNotExist(err) {
@@ -155,19 +149,103 @@ func (s *Server) handleContactByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// fetchCardDAVContacts fetches contacts from a CardDAV server.
-func fetchCardDAVContacts(url, username, password string) ([]*Contact, error) {
-	// Minimal CardDAV REPORT request
-	import_http := func() ([]*Contact, error) {
-		return nil, nil
+func (s *Server) handleContactsExport(w http.ResponseWriter, r *http.Request) {
+	contacts, err := s.loadContacts()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
-	_ = import_http
-	return fetchCardDAVImpl(url, username, password)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", `attachment; filename="contacts.json"`)
+	encodeJSON(w, contacts)
 }
 
-func fetchCardDAVImpl(url, username, password string) ([]*Contact, error) {
-	// Use net/http to do a basic PROPFIND/REPORT
-	// For now return empty — full CardDAV implementation requires vCard parsing
-	_ = auth.UserKey // keep import
-	return []*Contact{}, nil
+func (s *Server) handleContactsImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var incoming []*Contact
+	if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		return
+	}
+	existing, _ := s.loadContacts()
+	for _, c := range incoming {
+		if c.ID == "" {
+			c.ID = uuid.New().String()
+		}
+		existing = append(existing, c)
+	}
+	s.saveContacts(existing)
+	writeJSON(w, http.StatusOK, map[string]int{"imported": len(incoming)})
 }
+
+func (s *Server) handleContactsClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.saveContacts([]*Contact{})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleContactsConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"carddav_url":      settings.GetString("carddav_url"),
+			"carddav_username": settings.GetString("carddav_username"),
+			"configured":       settings.GetString("carddav_url") != "",
+		})
+	case http.MethodPost, http.MethodPut:
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+			return
+		}
+		current := settings.Load()
+		for k, v := range req {
+			current[k] = v
+		}
+		if err := settings.Save(current); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleContactsList(w http.ResponseWriter, r *http.Request) {
+	contacts, err := s.loadContacts()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"contacts": contacts, "count": len(contacts)})
+}
+
+func (s *Server) handleContactsAdd(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req Contact
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		return
+	}
+	if req.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"})
+		return
+	}
+	req.ID = uuid.New().String()
+	contacts, _ := s.loadContacts()
+	contacts = append(contacts, &req)
+	s.saveContacts(contacts)
+	writeJSON(w, http.StatusOK, &req)
+}
+
+

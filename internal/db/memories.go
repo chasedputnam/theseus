@@ -17,13 +17,13 @@ func (db *DB) AddMemory(m *Memory) error {
 
 // GetMemory returns a memory by ID.
 func (db *DB) GetMemory(id string) (*Memory, error) {
-	row := db.QueryRow(`SELECT id,text,category,source,owner,session_id,timestamp FROM memories WHERE id=?`, id)
+	row := db.QueryRow(`SELECT id,text,category,source,owner,session_id,timestamp,pinned FROM memories WHERE id=?`, id)
 	return scanMemory(row)
 }
 
 // ListMemories returns all memories for an owner.
 func (db *DB) ListMemories(owner string) ([]*Memory, error) {
-	q := `SELECT id,text,category,source,owner,session_id,timestamp FROM memories`
+	q := `SELECT id,text,category,source,owner,session_id,timestamp,pinned FROM memories`
 	args := []any{}
 	if owner != "" {
 		q += " WHERE owner=?"
@@ -51,7 +51,7 @@ func (db *DB) SearchMemories(query, owner string, limit int) ([]*Memory, error) 
 		conditions[i] = "LOWER(text) LIKE ?"
 		args[i] = "%" + w + "%"
 	}
-	q := `SELECT id,text,category,source,owner,session_id,timestamp FROM memories WHERE ` +
+	q := `SELECT id,text,category,source,owner,session_id,timestamp,pinned FROM memories WHERE ` +
 		strings.Join(conditions, " OR ")
 	if owner != "" {
 		q += " AND owner=?"
@@ -77,7 +77,7 @@ func (db *DB) GetMemoriesByIDs(ids []string, owner string) ([]*Memory, error) {
 	for i, id := range ids {
 		args[i] = id
 	}
-	q := `SELECT id,text,category,source,owner,session_id,timestamp FROM memories WHERE id IN (` + placeholders + `)`
+	q := `SELECT id,text,category,source,owner,session_id,timestamp,pinned FROM memories WHERE id IN (` + placeholders + `)`
 	if owner != "" {
 		q += " AND owner=?"
 		args = append(args, owner)
@@ -100,12 +100,24 @@ func (db *DB) DeleteMemory(id, owner string) error {
 	return err
 }
 
+// PinMemory toggles the pinned flag on a memory.
+func (db *DB) PinMemory(id, owner string, pinned bool) error {
+	val := 0
+	if pinned {
+		val = 1
+	}
+	_, err := db.Exec(`UPDATE memories SET pinned=? WHERE id=? AND owner=?`, val, id, owner)
+	return err
+}
+
 func scanMemory(row scanner) (*Memory, error) {
 	m := &Memory{}
-	err := row.Scan(&m.ID, &m.Text, &m.Category, &m.Source, &m.Owner, &m.SessionID, &m.Timestamp)
+	var pinned int
+	err := row.Scan(&m.ID, &m.Text, &m.Category, &m.Source, &m.Owner, &m.SessionID, &m.Timestamp, &pinned)
 	if err != nil {
 		return nil, err
 	}
+	m.Pinned = pinned != 0
 	return m, nil
 }
 
@@ -117,9 +129,11 @@ func scanMemories(rows interface {
 	var memories []*Memory
 	for rows.Next() {
 		m := &Memory{}
-		if err := rows.Scan(&m.ID, &m.Text, &m.Category, &m.Source, &m.Owner, &m.SessionID, &m.Timestamp); err != nil {
+		var pinned int
+		if err := rows.Scan(&m.ID, &m.Text, &m.Category, &m.Source, &m.Owner, &m.SessionID, &m.Timestamp, &pinned); err != nil {
 			return nil, err
 		}
+		m.Pinned = pinned != 0
 		memories = append(memories, m)
 	}
 	return memories, rows.Err()

@@ -132,3 +132,6 @@ func (s *Service) Stats() map[string]any {
 		"voice":     s.voice,
 	}
 }
+
+// ClearCache is a no-op placeholder; TTS caching is not yet implemented.
+func (s *Service) ClearCache() {}

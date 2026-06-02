@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"github.com/chaseputnam/theseus/internal/auth"
 	"github.com/chaseputnam/theseus/internal/calendar"
 	"github.com/chaseputnam/theseus/internal/db"
+	"github.com/chaseputnam/theseus/internal/llm"
 	"github.com/chaseputnam/theseus/internal/settings"
 	"github.com/google/uuid"
 )
@@ -19,8 +21,15 @@ func (s *Server) registerCalendarRoutes() {
 	s.mux.HandleFunc("/api/calendars", s.withAuth(s.handleCalendars))
 	s.mux.HandleFunc("/api/calendars/", s.withAuth(s.handleCalendarByID))
 	s.mux.HandleFunc("/api/calendar/events", s.withAuth(s.handleCalendarEvents))
+	s.mux.HandleFunc("/api/calendar/events/", s.withAuth(s.handleCalendarEventByUID))
 	s.mux.HandleFunc("/api/calendar/sync", s.withAuth(s.handleCalendarSync))
 	s.mux.HandleFunc("/api/calendar/import", s.withAuth(s.handleCalendarImport))
+	s.mux.HandleFunc("/api/calendar/config", s.withAuth(s.handleCalendarConfig))
+	s.mux.HandleFunc("/api/calendar/test", s.withAuth(s.handleCalendarTest))
+	s.mux.HandleFunc("/api/calendar/quick-parse", s.withAuth(s.handleCalendarQuickParse))
+	// Aliases: frontend uses /api/calendar/calendars* prefix
+	s.mux.HandleFunc("/api/calendar/calendars", s.withAuth(s.handleCalendars))
+	s.mux.HandleFunc("/api/calendar/calendars/", s.withAuth(s.handleCalendarAliasID))
 }
 
 func (s *Server) handleCalendars(w http.ResponseWriter, r *http.Request) {
@@ -289,4 +298,172 @@ func (s *Server) handleCalendarImport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"imported": imported})
+}
+
+func (s *Server) handleCalendarTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		URL      string `json:"url"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		return
+	}
+	if req.URL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url required"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	cfg := calendar.SyncConfig{
+		URL:      req.URL,
+		Username: req.Username,
+		Password: req.Password,
+	}
+	syncer := calendar.NewSyncer(s.db)
+	if err := syncer.Sync(ctx, cfg); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	user := auth.CurrentUser(r)
+	cals, _ := s.db.ListCalendars(user)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "calendars": len(cals)})
+}
+
+// handleCalendarAliasID rewrites /api/calendar/calendars/{id} to /api/calendars/{id}
+func (s *Server) handleCalendarAliasID(w http.ResponseWriter, r *http.Request) {
+	r.URL.Path = strings.Replace(r.URL.Path, "/api/calendar/calendars/", "/api/calendars/", 1)
+	s.handleCalendarByID(w, r)
+}
+
+// handleCalendarEventByUID handles DELETE /api/calendar/events/{uid}
+func (s *Server) handleCalendarEventByUID(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	user := auth.CurrentUser(r)
+	uid := strings.TrimPrefix(r.URL.Path, "/api/calendar/events/")
+	if uid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "uid required"})
+		return
+	}
+	// Verify ownership via calendar
+	cals, err := s.db.ListCalendars(user)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	from := time.Now().AddDate(-5, 0, 0)
+	to := time.Now().AddDate(5, 0, 0)
+	found := false
+	for _, cal := range cals {
+		events, _ := s.db.ListEvents(cal.ID, from, to)
+		for _, ev := range events {
+			if ev.UID == uid {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if !found && !s.auth.IsAdmin(user) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+		return
+	}
+	if err := s.db.DeleteEvent(uid); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleCalendarQuickParse parses a natural language event description via LLM.
+func (s *Server) handleCalendarQuickParse(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Text string `json:"text"`
+	}
+	if err := decodeBody(r, &req); err != nil || req.Text == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text required"})
+		return
+	}
+	endpointURL := settings.GetString("default_endpoint_url")
+	model := settings.GetString("default_model")
+	if endpointURL == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no LLM endpoint configured"})
+		return
+	}
+	prompt := `Parse the following natural language event description into a JSON object with fields: title (string), start (RFC3339), end (RFC3339), all_day (bool), location (string, optional). Return only valid JSON, no explanation.
+
+Event: ` + req.Text
+	client := llm.New()
+	ch, err := client.Stream(r.Context(), llm.StreamRequest{
+		URL:   endpointURL,
+		Model: model,
+		Messages: []llm.Message{
+			{Role: "user", Content: prompt},
+		},
+	})
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	var sb strings.Builder
+	for chunk := range ch {
+		if chunk.Error == nil {
+			sb.WriteString(chunk.Delta)
+		}
+	}
+	// Try to parse the LLM response as JSON; return raw if it fails
+	raw := strings.TrimSpace(sb.String())
+	// Strip markdown code fences if present
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimPrefix(raw, "```")
+	raw = strings.TrimSuffix(raw, "```")
+	raw = strings.TrimSpace(raw)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"raw": raw, "error": "could not parse LLM response as JSON"})
+		return
+	}
+	writeJSON(w, http.StatusOK, parsed)
+}
+
+func (s *Server) handleCalendarConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"caldav_url":      settings.GetString("caldav_url"),
+			"caldav_username": settings.GetString("caldav_username"),
+			"configured":      settings.GetString("caldav_url") != "",
+		})
+	case http.MethodPost, http.MethodPut:
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+			return
+		}
+		current := settings.Load()
+		for k, v := range req {
+			current[k] = v
+		}
+		if err := settings.Save(current); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }

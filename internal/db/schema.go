@@ -408,4 +408,7 @@ var schema = []string{
 	`CREATE INDEX IF NOT EXISTS ix_calendar_events_cal ON calendar_events(calendar_id)`,
 	`CREATE INDEX IF NOT EXISTS ix_calendar_events_uid ON calendar_events(uid)`,
 	`CREATE INDEX IF NOT EXISTS ix_calendar_events_time ON calendar_events(start_time, end_time)`,
+	`ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE gallery_images ADD COLUMN ai_tags TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE sessions ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`,
 }

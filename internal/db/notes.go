@@ -70,6 +70,12 @@ func (db *DB) DeleteNote(id string) error {
 	return err
 }
 
+// UpdateNoteSortOrder sets the sort_order for a note.
+func (db *DB) UpdateNoteSortOrder(id string, order int) error {
+	_, err := db.Exec(`UPDATE notes SET sort_order=?,updated_at=? WHERE id=?`, order, now(), id)
+	return err
+}
+
 func scanNote(row scanner) (*Note, error) {
 	n := &Note{}
 	var pinned, archived int

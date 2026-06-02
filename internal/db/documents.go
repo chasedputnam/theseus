@@ -80,6 +80,13 @@ func (db *DB) ListDocuments(owner string, includeArchived bool) ([]*Document, er
 	return docs, rows.Err()
 }
 
+// SessionHasDocuments returns true if any non-archived documents exist for the session.
+func (db *DB) SessionHasDocuments(sessionID string) (bool, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM documents WHERE session_id=? AND archived=0`, sessionID).Scan(&count)
+	return count > 0, err
+}
+
 // AddDocumentVersion inserts a version snapshot.
 func (db *DB) AddDocumentVersion(v *DocumentVersion) error {
 	_, err := db.Exec(`INSERT INTO document_versions
@@ -89,6 +96,20 @@ func (db *DB) AddDocumentVersion(v *DocumentVersion) error {
 		v.Summary, v.Source, now(),
 	)
 	return err
+}
+
+// GetDocumentVersionByNumber returns a specific version by number.
+func (db *DB) GetDocumentVersionByNumber(docID string, num int) (*DocumentVersion, error) {
+	v := &DocumentVersion{}
+	var createdAt string
+	err := db.QueryRow(`SELECT id,document_id,version_number,content,summary,source,created_at
+		FROM document_versions WHERE document_id=? AND version_number=?`, docID, num).
+		Scan(&v.ID, &v.DocumentID, &v.VersionNumber, &v.Content, &v.Summary, &v.Source, &createdAt)
+	if err != nil {
+		return nil, err
+	}
+	v.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+	return v, nil
 }
 
 // ListDocumentVersions returns all versions for a document.

@@ -11,6 +11,7 @@ import (
 func (s *Server) registerTTSRoutes() {
 	s.mux.HandleFunc("/api/tts/synthesize", s.withAuth(s.handleTTSSynthesize))
 	s.mux.HandleFunc("/api/tts/stats", s.withAuth(s.handleTTSStats))
+	s.mux.HandleFunc("/api/tts/clear-cache", s.withAuth(s.handleTTSClearCache))
 	s.mux.HandleFunc("/api/stt/transcribe", s.withAuth(s.handleSTTTranscribe))
 	s.mux.HandleFunc("/api/stt/stats", s.withAuth(s.handleSTTStats))
 }
@@ -62,6 +63,15 @@ func (s *Server) handleTTSSynthesize(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTTSStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.ttsService().Stats())
+}
+
+func (s *Server) handleTTSClearCache(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.ttsService().ClearCache()
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleSTTTranscribe(w http.ResponseWriter, r *http.Request) {

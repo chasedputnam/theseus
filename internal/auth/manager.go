@@ -298,6 +298,18 @@ func (m *Manager) Logout(token string) {
 	m.saveSessions()
 }
 
+// InvalidateUserSessions revokes all session tokens for a given username.
+func (m *Manager) InvalidateUserSessions(username string) {
+	m.mu.Lock()
+	for token, entry := range m.sessions {
+		if entry.Username == username {
+			delete(m.sessions, token)
+		}
+	}
+	m.mu.Unlock()
+	m.saveSessions()
+}
+
 // IsAdmin returns true if username is an admin.
 func (m *Manager) IsAdmin(username string) bool {
 	m.mu.RLock()

@@ -193,6 +193,150 @@ func (c *IMAPClient) MoveMessages(ctx context.Context, folder, dest string, uids
 	return err
 }
 
+// FetchMessage fetches a single message by UID with full body.
+func (c *IMAPClient) FetchMessage(ctx context.Context, folder string, uid uint32) (*Message, error) {
+	if _, err := c.client.Select(folder, nil).Wait(); err != nil {
+		return nil, err
+	}
+	seqSet := imap.UIDSetNum(imap.UID(uid))
+	fetchOptions := &imap.FetchOptions{
+		Flags:    true,
+		Envelope: true,
+		BodySection: []*imap.FetchItemBodySection{
+			{Specifier: imap.PartSpecifierNone},
+		},
+	}
+	msgs, err := c.client.Fetch(seqSet, fetchOptions).Collect()
+	if err != nil || len(msgs) == 0 {
+		return nil, fmt.Errorf("message not found")
+	}
+	return parseIMAPMessage(msgs[0], folder), nil
+}
+
+// MarkUnread marks messages as unread (removes Seen flag).
+func (c *IMAPClient) MarkUnread(ctx context.Context, folder string, uids []imap.UID) error {
+	if _, err := c.client.Select(folder, nil).Wait(); err != nil {
+		return err
+	}
+	seqSet := imap.UIDSetNum(uids...)
+	_, err := c.client.Store(seqSet, &imap.StoreFlags{
+		Op:    imap.StoreFlagsDel,
+		Flags: []imap.Flag{imap.FlagSeen},
+	}, nil).Collect()
+	return err
+}
+
+// SetFlag adds or removes a custom flag on messages.
+func (c *IMAPClient) SetFlag(ctx context.Context, folder string, uids []imap.UID, flag imap.Flag, add bool) error {
+	if _, err := c.client.Select(folder, nil).Wait(); err != nil {
+		return err
+	}
+	seqSet := imap.UIDSetNum(uids...)
+	op := imap.StoreFlagsAdd
+	if !add {
+		op = imap.StoreFlagsDel
+	}
+	_, err := c.client.Store(seqSet, &imap.StoreFlags{
+		Op:    op,
+		Flags: []imap.Flag{flag},
+	}, nil).Collect()
+	return err
+}
+
+// SearchMessages searches for messages matching a query string.
+func (c *IMAPClient) SearchMessages(ctx context.Context, folder, query string, limit int) ([]*Message, error) {
+	if _, err := c.client.Select(folder, nil).Wait(); err != nil {
+		return nil, err
+	}
+	criteria := &imap.SearchCriteria{
+		Text: []string{query},
+	}
+	results, err := c.client.Search(criteria, nil).Wait()
+	if err != nil {
+		return nil, err
+	}
+	if len(results.AllUIDs()) == 0 {
+		return []*Message{}, nil
+	}
+	uids := results.AllUIDs()
+	if limit > 0 && len(uids) > limit {
+		uids = uids[len(uids)-limit:]
+	}
+	seqSet := imap.UIDSetNum(uids...)
+	fetchOptions := &imap.FetchOptions{
+		Flags:    true,
+		Envelope: true,
+		BodySection: []*imap.FetchItemBodySection{
+			{Specifier: imap.PartSpecifierNone},
+		},
+	}
+	msgs, err := c.client.Fetch(seqSet, fetchOptions).Collect()
+	if err != nil {
+		return nil, err
+	}
+	var out []*Message
+	for _, m := range msgs {
+		out = append(out, parseIMAPMessage(m, folder))
+	}
+	return out, nil
+}
+
+// FetchAttachment fetches a specific attachment by index from a message.
+func (c *IMAPClient) FetchAttachment(ctx context.Context, folder string, uid uint32, index int) (*Attachment, error) {
+	if _, err := c.client.Select(folder, nil).Wait(); err != nil {
+		return nil, err
+	}
+	seqSet := imap.UIDSetNum(imap.UID(uid))
+	fetchOptions := &imap.FetchOptions{
+		BodySection: []*imap.FetchItemBodySection{
+			{Specifier: imap.PartSpecifierNone},
+		},
+	}
+	msgs, err := c.client.Fetch(seqSet, fetchOptions).Collect()
+	if err != nil || len(msgs) == 0 {
+		return nil, fmt.Errorf("message not found")
+	}
+	msg := msgs[0]
+	attIdx := 0
+	for _, section := range msg.BodySection {
+		if len(section.Bytes) == 0 {
+			continue
+		}
+		mr, err := mail.CreateReader(strings.NewReader(string(section.Bytes)))
+		if err != nil {
+			continue
+		}
+		for {
+			part, err := mr.NextPart()
+			if err != nil {
+				break
+			}
+			ct := part.Header.Get("Content-Type")
+			if !strings.HasPrefix(ct, "text/plain") && !strings.HasPrefix(ct, "text/html") {
+				if attIdx == index {
+					data, _ := io.ReadAll(part.Body)
+					filename := ""
+					if cd := part.Header.Get("Content-Disposition"); cd != "" {
+						for _, p := range strings.Split(cd, ";") {
+							p = strings.TrimSpace(p)
+							if strings.HasPrefix(p, "filename=") {
+								filename = strings.Trim(strings.TrimPrefix(p, "filename="), `"`)
+							}
+						}
+					}
+					return &Attachment{
+						Filename:    filename,
+						ContentType: ct,
+						Data:        data,
+					}, nil
+				}
+				attIdx++
+			}
+		}
+	}
+	return nil, fmt.Errorf("attachment %d not found", index)
+}
+
 func parseIMAPMessage(msg *imapclient.FetchMessageBuffer, folder string) *Message {
 	m := &Message{
 		UID:    uint32(msg.UID),

@@ -25,6 +25,8 @@ type ServerConfig struct {
 	Env           map[string]string
 	URL           string
 	DisabledTools []string
+	OAuthURL      string
+	OAuthToken    string
 }
 
 // ServerConn represents a connected MCP server.
@@ -163,16 +165,68 @@ func (m *Manager) Status() []map[string]any {
 	defer m.mu.RUnlock()
 	var statuses []map[string]any
 	for _, conn := range m.servers {
+		enabledCount := 0
+		disabled := make(map[string]bool, len(conn.Config.DisabledTools))
+		for _, t := range conn.Config.DisabledTools {
+			disabled[t] = true
+		}
+		for _, t := range conn.Tools {
+			if !disabled[t.Name] {
+				enabledCount++
+			}
+		}
 		statuses = append(statuses, map[string]any{
-			"id":         conn.Config.ID,
-			"name":       conn.Config.Name,
-			"transport":  conn.Config.Transport,
-			"status":     conn.Status,
-			"error":      conn.Error,
-			"tool_count": len(conn.Tools),
+			"id":                conn.Config.ID,
+			"name":              conn.Config.Name,
+			"transport":         conn.Config.Transport,
+			"status":            conn.Status,
+			"error":             conn.Error,
+			"tool_count":        len(conn.Tools),
+			"enabled_tool_count": enabledCount,
+			"is_enabled":        conn.Status != "disconnected",
+			"needs_oauth":       conn.Config.OAuthURL != "" && conn.Config.OAuthToken == "",
 		})
 	}
 	return statuses
+}
+
+// Reconnect disconnects and reconnects a server by ID.
+func (m *Manager) Reconnect(ctx context.Context, serverID string) error {
+	m.mu.RLock()
+	conn, ok := m.servers[serverID]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("server %q not found", serverID)
+	}
+	cfg := conn.Config
+	m.Disconnect(serverID)
+	return m.Connect(ctx, cfg)
+}
+
+// SetEnabled marks a server as enabled or disabled without disconnecting.
+func (m *Manager) SetEnabled(serverID string, enabled bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	conn, ok := m.servers[serverID]
+	if !ok {
+		return
+	}
+	if enabled && conn.Status == "disconnected" {
+		conn.Status = "connected"
+	} else if !enabled {
+		conn.Status = "disconnected"
+	}
+}
+
+// GetServerTools returns tools for a specific server by ID, with disabled flag.
+func (m *Manager) GetServerTools(serverID string) ([]ToolSchema, []string, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	conn, ok := m.servers[serverID]
+	if !ok {
+		return nil, nil, false
+	}
+	return conn.Tools, conn.Config.DisabledTools, true
 }
 
 // ServerIDs returns all server IDs.
@@ -184,6 +238,25 @@ func (m *Manager) ServerIDs() []string {
 		ids = append(ids, id)
 	}
 	return ids
+}
+
+// SetToken stores an OAuth token for a server.
+func (m *Manager) SetToken(id, token string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if conn, ok := m.servers[id]; ok {
+		conn.Config.OAuthToken = token
+	}
+}
+
+// GetOAuthURL returns the OAuth URL for a server, or empty string if not found.
+func (m *Manager) GetOAuthURL(id string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if conn, ok := m.servers[id]; ok {
+		return conn.Config.OAuthURL
+	}
+	return ""
 }
 
 // parseArgs parses a JSON string into a map.

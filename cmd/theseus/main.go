@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -56,7 +55,7 @@ func main() {
 	log.Printf("Theseus listening on http://localhost%s (data=%s, static=%s, auth=%v)",
 		addr, *dataDir, *staticDir, authEnabled)
 
-	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
+	if err := server.RunWithGracefulShutdown(addr, srv.Handler()); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }

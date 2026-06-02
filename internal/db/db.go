@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -53,4 +54,9 @@ func (db *DB) Migrate() error {
 		}
 	}
 	return nil
+}
+
+// Ping checks database connectivity.
+func (db *DB) Ping() error {
+	return db.DB.PingContext(context.Background())
 }

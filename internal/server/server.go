@@ -1,8 +1,11 @@
 package server
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -10,11 +13,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chaseputnam/theseus/internal/agent"
 	"github.com/chaseputnam/theseus/internal/auth"
+	"github.com/chaseputnam/theseus/internal/chat"
+	"github.com/chaseputnam/theseus/internal/llm"
+	"github.com/chaseputnam/theseus/internal/mcp"
 	"github.com/chaseputnam/theseus/internal/memory"
 	"github.com/chaseputnam/theseus/internal/db"
+	"github.com/chaseputnam/theseus/internal/research"
+	"github.com/chaseputnam/theseus/internal/search"
 	"github.com/chaseputnam/theseus/internal/settings"
 	"github.com/chaseputnam/theseus/internal/storage"
+	"github.com/chaseputnam/theseus/internal/tools"
 )
 
 // Config holds server startup configuration.
@@ -28,11 +38,13 @@ type Config struct {
 
 // Server is the main HTTP server.
 type Server struct {
-	cfg    Config
-	db     *db.DB
-	auth   *auth.Manager
-	mux    *http.ServeMux
-	memMgr *memory.Manager
+	cfg        Config
+	db         *db.DB
+	auth       *auth.Manager
+	mux        *http.ServeMux
+	memMgr     *memory.Manager
+	mcpManager *mcp.Manager
+	chatHandler *chat.Handler
 }
 
 // New creates and wires up the server.
@@ -80,7 +92,75 @@ func New(cfg Config) (*Server, error) {
 	}
 	memMgr := memory.New(database, chromaHost, chromaPort)
 
-	s := &Server{cfg: cfg, db: database, auth: authMgr, mux: http.NewServeMux(), memMgr: memMgr}
+	llmClient := llm.New()
+	dispatcher := tools.New(&tools.Deps{DataDir: cfg.DataDir, DB: database})
+	agentFn := func(ctx context.Context, req chat.AgentRequest, w http.ResponseWriter) error {
+		sse := agent.NewSSEWriter(w)
+		return agent.Run(ctx, agent.Request{
+			SessionID:   req.SessionID,
+			Messages:    req.Messages,
+			Owner:       req.Owner,
+			EndpointURL: req.EndpointURL,
+			Model:       req.Model,
+			Headers:     req.Headers,
+		}, llmClient, dispatcher, sse)
+	}
+	researchFn := func(ctx context.Context, question, endpointURL, model string, headers map[string]string, sendEvent func(string, string)) error {
+		searchClient := search.BuildFromSettings(
+			settings.GetString("search_provider"),
+			settings.GetString("search_url"),
+			[]string{"duckduckgo"},
+			settings.GetString("brave_api_key"),
+			settings.GetString("google_pse_key"),
+			settings.GetString("google_pse_cx"),
+			settings.GetString("tavily_api_key"),
+			settings.GetString("serper_api_key"),
+		)
+		engine := research.New(llmClient, searchClient)
+		progress := make(chan research.ProgressEvent, 32)
+		var result *research.Result
+		var runErr error
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			result, runErr = engine.Run(ctx, research.Request{
+				Question:    question,
+				EndpointURL: endpointURL,
+				Model:       model,
+				Headers:     headers,
+			}, progress)
+		}()
+		for ev := range progress {
+			d, _ := json.Marshal(map[string]any{"type": "research_progress", "data": ev})
+			sendEvent("delta", string(d))
+		}
+		<-done
+		if runErr != nil {
+			return runErr
+		}
+		if len(result.Sources) > 0 {
+			d, _ := json.Marshal(map[string]any{"type": "research_sources", "data": result.Sources})
+			sendEvent("delta", string(d))
+		}
+		// Emit report as a delta so it renders in the chat bubble
+		if result.Report != "" {
+			d, _ := json.Marshal(map[string]string{"delta": result.Report})
+			sendEvent("delta", string(d))
+		}
+		d, _ := json.Marshal(map[string]string{"type": "research_done"})
+		sendEvent("delta", string(d))
+		return nil
+	}
+
+	s := &Server{
+		cfg:         cfg,
+		db:          database,
+		auth:        authMgr,
+		mux:         http.NewServeMux(),
+		memMgr:      memMgr,
+		mcpManager:  mcp.New(),
+		chatHandler: chat.New(database, llmClient, authMgr, agentFn, researchFn),
+	}
 	s.registerRoutes()
 	return s, nil
 }
@@ -90,10 +170,7 @@ func (s *Server) registerRoutes() {
 	auth.RegisterRoutes(s.mux, s.auth)
 
 	// Health / version (exempt)
-	s.mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintln(w, `{"status":"ok"}`)
-	})
+	s.mux.HandleFunc("/api/health", s.handleHealthWithDB)
 	s.mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintln(w, `{"version":"1.0.0","runtime":"go"}`)
@@ -116,16 +193,29 @@ func (s *Server) registerRoutes() {
 	s.registerWebhookRoutes()
 	s.registerBackupRoutes()
 	s.registerAdminRoutes()
+	s.registerPersonalRoutes()
+	s.registerSkillsRoutes()
+	s.registerEmailRoutes()
+	s.registerMCPRoutes()
+	s.registerPrefsRoutes()
+	s.registerSignaturesRoutes()
+	s.registerAssistantRoutes()
+	s.registerImageRoutes()
+	s.registerCompatRoutes()
 
 	// Memory routes
 	s.mux.HandleFunc("/api/memory", s.withAuth(s.handleMemory))
 	s.mux.HandleFunc("/api/memory/", s.withAuth(s.handleMemoryOps))
 
-	// Chat routes
-	s.mux.HandleFunc("/api/chat", s.withAuth(s.handleChat))
+	// Chat routes — use the real chat.Handler for both paths
+	s.mux.HandleFunc("/api/chat", s.withAuth(s.chatHandler.ServeHTTP))
+	s.mux.HandleFunc("/api/chat_stream", s.withAuth(s.chatHandler.ServeHTTP))
 
 	// Static files
-	fs := http.FileServer(http.Dir(s.cfg.StaticDir))
+	_ = mime.AddExtensionType(".css", "text/css; charset=utf-8")
+	_ = mime.AddExtensionType(".js", "application/javascript; charset=utf-8")
+	_ = mime.AddExtensionType(".mjs", "application/javascript; charset=utf-8")
+	fs := http.StripPrefix("/static/", http.FileServer(http.Dir(s.cfg.StaticDir)))
 	s.mux.HandleFunc("/static/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/static/sw.js" {
 			w.Header().Set("Service-Worker-Allowed", "/")
@@ -151,11 +241,25 @@ func (s *Server) Handler() http.Handler {
 		"/api/chat", "/api/shell/stream", "/api/research",
 		"/api/model/download", "/api/model/probe", "/api/model-endpoints",
 		"/api/cookbook/setup", "/api/upload", "/api/image",
+		"/api/personal/upload", "/api/gallery/upload",
+		"/api/email/compose-upload", "/api/email/attachment",
+		"/api/documents/import-pdf",
+	}
+	bodyExempt := []string{
+		"/api/chat", "/api/shell", "/api/research",
+		"/api/upload", "/api/image", "/api/personal/upload",
+		"/api/gallery/upload", "/api/email/compose-upload",
+		"/api/email/attachment", "/api/documents/import-pdf",
+		"/api/tts/synthesize", "/api/stt/transcribe",
 	}
 	authMW := auth.Middleware(s.auth, s.cfg.AuthEnabled, s.cfg.LocalhostBypass)
-	return SecurityHeadersMiddleware(
-		RequestTimeoutMiddleware(45*time.Second, exemptPrefixes)(
-			authMW(s.mux),
+	return LoggingMiddleware(
+		SecurityHeadersMiddleware(
+			RequestTimeoutMiddleware(45*time.Second, exemptPrefixes)(
+				MaxBodyMiddleware(1<<20, bodyExempt)(
+					authMW(s.mux),
+				),
+			),
 		),
 	)
 }

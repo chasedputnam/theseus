@@ -76,7 +76,7 @@ func TestChatStreamingSSE(t *testing.T) {
 	database.CreateSession(sess)
 
 	llmClient := llm.New()
-	h := New(database, llmClient, mgr, nil)
+	h := New(database, llmClient, mgr, nil, nil)
 
 	body := fmt.Sprintf(`{"session_id":%q,"message":"hi","mode":"chat"}`, sess.ID)
 	req := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(body))

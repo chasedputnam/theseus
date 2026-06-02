@@ -27,15 +27,15 @@ func StartDownload(repoID, filename, cacheDir, hfToken, sessionName string) (*Tm
 	var cmd string
 	if filename != "" {
 		cmd = fmt.Sprintf("huggingface-cli download %s %s --local-dir %s",
-			shellQuote(repoID), shellQuote(filename), shellQuote(cacheDir))
+			ShellQuote(repoID), ShellQuote(filename), ShellQuote(cacheDir))
 	} else {
 		cmd = fmt.Sprintf("huggingface-cli download %s --local-dir %s",
-			shellQuote(repoID), shellQuote(cacheDir))
+			ShellQuote(repoID), ShellQuote(cacheDir))
 	}
 	if hfToken != "" {
-		cmd = fmt.Sprintf("HF_TOKEN=%s %s", shellQuote(hfToken), cmd)
+		cmd = fmt.Sprintf("HF_TOKEN=%s %s", ShellQuote(hfToken), cmd)
 	}
-	cmd += fmt.Sprintf(" 2>&1 | tee %s", shellQuote(logFile))
+	cmd += fmt.Sprintf(" 2>&1 | tee %s", ShellQuote(logFile))
 
 	return startTmuxSession(sessionName, cmd, logFile)
 }
@@ -53,13 +53,13 @@ func StartServe(backend, modelPath, extraArgs, sessionName string) (*TmuxSession
 	switch backend {
 	case "vllm":
 		cmd = fmt.Sprintf("python -m vllm.entrypoints.openai.api_server --model %s %s",
-			shellQuote(modelPath), extraArgs)
+			ShellQuote(modelPath), extraArgs)
 	case "llama.cpp":
-		cmd = fmt.Sprintf("llama-server -m %s %s", shellQuote(modelPath), extraArgs)
+		cmd = fmt.Sprintf("llama-server -m %s %s", ShellQuote(modelPath), extraArgs)
 	default:
 		return nil, fmt.Errorf("unknown backend: %s", backend)
 	}
-	cmd += fmt.Sprintf(" 2>&1 | tee %s", shellQuote(logFile))
+	cmd += fmt.Sprintf(" 2>&1 | tee %s", ShellQuote(logFile))
 
 	return startTmuxSession(sessionName, cmd, logFile)
 }
@@ -102,8 +102,15 @@ func ensureTmux() error {
 	return nil
 }
 
-func shellQuote(s string) string {
+// ShellQuote wraps s in single quotes, escaping any single quotes inside.
+func ShellQuote(s string) string {
 	// Wrap in single quotes, escaping any single quotes inside
 	s = strings.ReplaceAll(s, `'`, `'"'"'`)
 	return `'` + s + `'`
+}
+
+// StartTmux starts a command in a named tmux session, logging to logFile.
+func StartTmux(name, cmd, logFile string) error {
+	_, err := startTmuxSession(name, cmd, logFile)
+	return err
 }

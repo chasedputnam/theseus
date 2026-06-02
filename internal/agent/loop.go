@@ -54,7 +54,7 @@ func (s *SSEWriter) Send(event, data string) {
 }
 
 func (s *SSEWriter) SendDelta(content string) {
-	d, _ := json.Marshal(map[string]string{"content": content})
+	d, _ := json.Marshal(map[string]string{"delta": content})
 	s.Send("delta", string(d))
 }
 
@@ -70,10 +70,14 @@ func (s *SSEWriter) SendToolResult(toolType, result string) {
 
 func (s *SSEWriter) SendDone() {
 	s.Send("done", `{"status":"done"}`)
+	fmt.Fprintf(s.w, "data: [DONE]\n\n")
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
 }
 
 func (s *SSEWriter) SendError(err error) {
-	d, _ := json.Marshal(map[string]string{"error": err.Error()})
+	d, _ := json.Marshal(map[string]string{"error": err.Error(), "text": err.Error()})
 	s.Send("error", string(d))
 }
 
